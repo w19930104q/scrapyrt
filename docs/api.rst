@@ -491,6 +491,17 @@ TIMEOUT_LIMIT
 
 Use this setting to limit crawl time.
 
+The limit is a hard deadline measured from the moment the crawl starts, not
+from the last scheduled request. When it expires, the crawl is stopped (pending
+downloads are cancelled when supported by the installed Scrapy version) and the
+API responds with HTTP 504 and the usual error JSON document, for example::
+
+    {
+        "status": "error",
+        "message": "Crawl of spider ... exceeded TIMEOUT_LIMIT of 120 seconds",
+        "code": 504
+    }
+
 Default: ``1000``.
 
 DEBUG

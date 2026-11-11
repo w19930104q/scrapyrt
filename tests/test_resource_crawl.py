@@ -520,3 +520,49 @@ class TestCrawlResourceIntegration:
             assert len(res_json["items"]) == 1
 
         check_res(res)
+
+
+class TestCrawlTimeoutIntegration:
+    """End-to-end check of the hard deadline against a local hanging page."""
+
+    TIMEOUT_LIMIT = 2
+
+    @pytest.fixture
+    def timeout_server(self):
+        site = MockServer()
+        site.start()
+        server = ScrapyrtTestServer(site=site)
+        server.arguments += ["-s", f"TIMEOUT_LIMIT={self.TIMEOUT_LIMIT}"]
+        server.start()
+        yield server
+        server.stop()
+        site.stop()
+
+    @pytest.mark.parametrize("method", (perform_get, perform_post))
+    def test_hanging_download_returns_504_and_server_survives(
+        self,
+        timeout_server,
+        method,
+    ):
+        res = method(
+            timeout_server.url("crawl.json"),
+            {"spider_name": "test"},
+            {"url": timeout_server.site.url("hang")},
+        )
+        assert res.status_code == 504
+        res_json = res.json()
+        assert res_json["status"] == "error"
+        assert res_json["code"] == 504
+        assert res_json["message"]
+
+        # The crawl was stopped without restarting the reactor: the server
+        # keeps serving normal crawls.
+        res = method(
+            timeout_server.url("crawl.json"),
+            {"spider_name": "test"},
+            {"url": timeout_server.site.url("page1.html")},
+        )
+        assert res.status_code == 200
+        res_json = res.json()
+        assert res_json["status"] == "ok"
+        assert res_json["items"] == [{"name": ["Page 1"]}]

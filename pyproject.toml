@@ -115,6 +115,11 @@ per-file-ignores = [
 
 [tool.pytest.ini_options]
 python_files = ["test_*.py", "test_*/__init__.py"]
+# pytest-twisted is not a test dependency. If it happens to be installed it
+# auto-loads and installs the default (non-asyncio) reactor before
+# tests/__init__.py can install the asyncio one, which makes Scrapy's reactor
+# check fail depending on test ordering. Keep test runs deterministic.
+addopts = ["-p", "no:twisted"]
 
 [tool.ruff.lint]
 extend-select = [

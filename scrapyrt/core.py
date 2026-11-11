@@ -10,6 +10,9 @@ from scrapy import Spider, signals
 from scrapy.crawler import Crawler, CrawlerRunner
 from scrapy.exceptions import DontCloseSpider
 from scrapy.http import Request
+from scrapy.utils.defer import deferred_from_coro
+from twisted.internet.defer import Deferred
+from twisted.python.failure import Failure
 from twisted.web.error import Error
 
 from . import log
@@ -53,6 +56,11 @@ class ScrapyrtCrawlerRunner(CrawlerRunner):
 class CrawlManager:  # pylint: disable=too-many-instance-attributes
     """Runs crawls."""
 
+    # Clock used to schedule the hard crawl deadline. It is kept as ``None``
+    # here so that the reactor is imported lazily, and so that tests can
+    # replace it with a ``twisted.internet.task.Clock`` to control time.
+    clock = None
+
     def __init__(  # noqa: PLR0913  # pylint: disable=too-many-positional-arguments
         self,
         spider_name,
@@ -75,7 +83,11 @@ class CrawlManager:  # pylint: disable=too-many-instance-attributes
         self.debug = app_settings.DEBUG
         self.crawler_runner = None
         self.crawler = None
-        self.crawl_start_time = dt.datetime.now(dt.timezone.utc)
+        # Only the first terminal state (finished, timeout or client
+        # disconnect) is allowed to take effect.
+        self._terminal_state = None
+        self._timeout_call = None
+        self._result = None
         # callback will be added after instantiation of crawler object
         # because we need to know if spider has method available
         self.callback_name = request_kwargs.pop("callback", None) or "parse"
@@ -143,6 +155,7 @@ class CrawlManager:  # pylint: disable=too-many-instance-attributes
                 )
         if not self.spider_start:
             self.set_dummy_start_methods(spidercls)
+        self._result = Deferred()
         dfd = self.crawler_runner.crawl(spidercls, *args, **kwargs)
 
         def cleanup_logging(result):
@@ -152,8 +165,114 @@ class CrawlManager:  # pylint: disable=too-many-instance-attributes
 
         dfd.addBoth(self.restore_start_methods)
         dfd.addBoth(cleanup_logging)
+        dfd.addBoth(self._cancel_timeout)
         dfd.addCallback(self.return_items)
-        return dfd
+        dfd.addBoth(self._on_crawl_done)
+        self._start_timeout()
+        if self._terminal_state is not None:
+            # The crawl already ended while the chain above was being
+            # assembled (e.g. it failed before the deadline was scheduled);
+            # don't leave a deadline behind.
+            self._cancel_timeout()
+        return self._result
+
+    def _start_timeout(self):
+        """Schedule a hard deadline for the whole crawl.
+
+        Unlike the old behaviour, the deadline is measured from the moment the
+        crawl starts and does not depend on new requests being scheduled, so a
+        stuck download still triggers it.
+        """
+        clock = self.clock
+        if clock is None:
+            # Imported lazily, the reactor must be installed before importing
+            # ScrapyRT.
+            from twisted.internet import (
+                reactor,  # pylint: disable=import-outside-toplevel
+            )
+
+            clock = reactor
+        self._timeout_call = clock.callLater(self.timeout_limit, self._on_timeout)
+
+    def _cancel_timeout(self, result=None):
+        """Cancel the pending deadline, if any. Leaves ``result`` untouched."""
+        if self._timeout_call is not None:
+            if self._timeout_call.active():
+                self._timeout_call.cancel()
+            self._timeout_call = None
+        return result
+
+    def _set_terminal_state(self, state):
+        """Register the first terminal state and return whether it won."""
+        if self._terminal_state is not None:
+            return False
+        self._terminal_state = state
+        self._cancel_timeout()
+        return True
+
+    def _on_timeout(self):
+        self._timeout_call = None
+        if not self._set_terminal_state("timeout"):
+            return
+        message = (
+            f"Crawl of spider {self.spider_name} exceeded TIMEOUT_LIMIT "
+            f"of {self.timeout_limit} seconds"
+        )
+        log.msg(message, level=log.WARNING)
+        self._stop_crawl(reason="timeout")
+        self._result.errback(Failure(Error(504, message=message.encode())))
+
+    def cancel(self, reason="client disconnected"):
+        """Cancel the crawl because the client is gone.
+
+        The response cannot be delivered anymore, so the crawl result is not
+        fired at all: only the crawl itself is stopped and cleaned up.
+        """
+        if not self._set_terminal_state("cancelled"):
+            return
+        log.msg(f"Cancelling crawl of spider {self.spider_name}: {reason}")
+        self._stop_crawl(reason=reason)
+
+    def _stop_crawl(self, reason):
+        """Stop the crawl and cancel in-flight downloads when supported."""
+        if self.crawler is None or self.crawler.engine is None:
+            return
+        engine = self.crawler.engine
+        close_async = getattr(engine, "close_spider_async", None)
+        if close_async is not None:
+            try:
+                # Scrapy >= 2.20: "fast" mode drops the pending downloads,
+                # which is what makes a crawl stuck on a hanging download
+                # actually terminate.
+                dfd = deferred_from_coro(close_async(reason=reason, mode="fast"))
+            except TypeError:
+                # Older Scrapy versions close the spider gracefully, waiting
+                # for the in-flight downloads to finish.
+                dfd = deferred_from_coro(close_async(reason=reason))
+        else:
+            spider = self.crawler.spider
+            if spider is None:
+                return
+            dfd = engine.close_spider(spider, reason=reason)
+        dfd.addErrback(self._ignore_stop_error)
+
+    @staticmethod
+    def _ignore_stop_error(failure):
+        # The spider may still be opening (or the engine may be gone), in
+        # which case there is nothing to close.
+        failure.trap(RuntimeError)
+
+    def _on_crawl_done(self, result):
+        """Deliver the crawl result unless another terminal state won."""
+        if not self._set_terminal_state("finished"):
+            # Timeout or client disconnect already won; consume the late
+            # result so that it isn't reported as an unhandled error.
+            return
+        if isinstance(result, Failure):
+            self._result.errback(result)
+        else:
+            self._result.callback(result)
+        return
 
     def set_dummy_start_methods(self, spidercls):
         if hasattr(spidercls, "start"):
@@ -250,19 +369,16 @@ class CrawlManager:  # pylint: disable=too-many-instance-attributes
         """Handler of request_scheduled signal.
 
         For every scheduled request check if number of requests is less
-        then limit and runtime doesn't exceed limit as well.
+        then limit.
+
+        The crawl runtime is not checked here: ``CrawlManager`` enforces it
+        with a hard deadline scheduled when the crawl starts, so a crawl with
+        no new requests (e.g. one stuck downloading) still times out.
 
         """
         assert self.crawler is not None
         if spider is self.crawler.spider:
             self.limit_requests(spider)
-            self.limit_runtime(spider)
-
-    def limit_runtime(self, spider):
-        """Stop crawl if it takes too long."""
-        time_now = dt.datetime.now(dt.timezone.utc)
-        if (time_now - self.crawl_start_time).seconds >= self.timeout_limit:
-            spider.crawler.engine.close_spider(spider, reason="timeout")
 
     def limit_requests(self, spider):
         """Stop crawl after reaching max_requests."""

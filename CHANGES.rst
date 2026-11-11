@@ -7,6 +7,13 @@ ScrapyRT 0.19.0 (unreleased)
 -   Added a ``max_items`` API parameter to stop the crawl once a given number
     of items has been scraped.
 
+-   ``TIMEOUT_LIMIT`` is now a hard deadline measured from the start of each
+    crawl instead of a check performed when requests are scheduled. A crawl
+    stuck in a download now times out and gets cancelled (pending downloads are
+    cancelled when the installed Scrapy version supports it), and the API
+    responds with HTTP 504. A crawl is also cancelled when the client
+    disconnects.
+
 ScrapyRT 0.18.1 (2026-06-29)
 ----------------------------
 

@@ -2,7 +2,6 @@ import contextlib
 import datetime as dt
 import re
 from pathlib import Path
-from time import sleep
 from unittest.mock import MagicMock
 
 import pytest
@@ -125,12 +124,10 @@ class TestHandleScheduling(TestCrawlManager):
     def setUp(self):
         super().setUp()
         self.crawl_manager.limit_requests = MagicMock()
-        self.crawl_manager.limit_runtime = MagicMock()
 
     def test_handle_scheduling(self):
         self.crawl_manager.handle_scheduling(self.crawl_manager.request, self.spider)
         self.crawl_manager.limit_requests.assert_called_once_with(self.spider)
-        self.crawl_manager.limit_runtime.assert_called_once_with(self.spider)
 
     def test_handle_scheduling_another_spider(self):
         self.crawl_manager.handle_scheduling(
@@ -138,31 +135,26 @@ class TestHandleScheduling(TestCrawlManager):
             self.another_spider,
         )
         assert not self.crawl_manager.limit_requests.called
-        assert not self.crawl_manager.limit_runtime.called
 
-
-class TestLimitRuntime(TestCrawlManager):
-    def setUp(self):
-        super().setUp()
-        self.crawl_manager.timeout_limit = 1
-        self.crawler.stats.get_value.return_value = dt.datetime.now(dt.timezone.utc)
-
-    def _test_limit_runtime(self):
-        self.crawl_manager.limit_runtime(self.spider)
+    def test_handle_scheduling_does_not_check_runtime(self):
+        # The runtime is enforced by a hard deadline instead of when requests
+        # are scheduled.
+        assert not hasattr(self.crawl_manager, "limit_runtime")
+        self.crawl_manager.timeout_limit = 0
+        self.crawl_manager.handle_scheduling(self.crawl_manager.request, self.spider)
         assert not self.crawler.engine.close_spider.called
-        sleep(1)
-        self.crawl_manager.limit_runtime(self.spider)
-        assert self.crawler.engine.close_spider.called
 
-    def test_limit_runtime(self):
-        self._test_limit_runtime()
+
+class TestTimeoutLimit(TestCrawlManager):
+    def test_timeout_limit_is_int(self):
+        assert isinstance(self.crawl_manager.timeout_limit, int)
 
     def test_string_number_timeout_value(self):
         _timeout = app_settings.TIMEOUT_LIMIT
         try:
             app_settings.TIMEOUT_LIMIT = "1"  # type: ignore[assignment]
-            self.crawl_manager = self.create_crawl_manager()
-            self._test_limit_runtime()
+            crawl_manager = self.create_crawl_manager()
+            assert crawl_manager.timeout_limit == 1
         finally:
             app_settings.TIMEOUT_LIMIT = _timeout
 

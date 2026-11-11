@@ -37,13 +37,30 @@ class ServiceResource(resource.Resource):
         if not isinstance(result, Deferred):
             return self.render_object(result, request)
 
+        # A client may disconnect before the deferred fires. In that case
+        # there is no response left to write to or to finish.
+        disconnected = False
+
+        def on_disconnect(_):
+            nonlocal disconnected
+            disconnected = True
+
+        request.notifyFinish().addErrback(on_disconnect)
+
         # deferred result - add appropriate callbacks and errbacks
-        result.addErrback(self.handle_error, request)
+        def handle_error_if_connected(exception_or_failure):
+            if disconnected:
+                return None
+            return self.handle_error(exception_or_failure, request)
 
         def finish_request(obj):
+            if disconnected:
+                return
             request.write(self.render_object(obj, request))
             request.finish()
+            return
 
+        result.addErrback(handle_error_if_connected)
         result.addCallback(finish_request)
         return server.NOT_DONE_YET
 
@@ -123,7 +140,12 @@ class CrawlResource(ServiceResource):
         scrapy_request_args = extract_scrapy_request_args(api_params, raise_error=False)
         self.validate_options(scrapy_request_args, api_params)
 
-        return self.prepare_crawl(api_params, scrapy_request_args, **kwargs)
+        return self.prepare_crawl(
+            api_params,
+            scrapy_request_args,
+            request=request,
+            **kwargs,
+        )
 
     def render_POST(self, request, **kwargs):  # pylint: disable=invalid-name
         """
@@ -164,7 +186,12 @@ class CrawlResource(ServiceResource):
             raise Error(400, str(e).encode()) from e
 
         self.validate_options(scrapy_request_args, api_params)
-        return self.prepare_crawl(api_params, scrapy_request_args, **kwargs)
+        return self.prepare_crawl(
+            api_params,
+            scrapy_request_args,
+            request=request,
+            **kwargs,
+        )
 
     def validate_options(self, scrapy_request_args, api_params):
         url = scrapy_request_args.get("url")
@@ -212,7 +239,14 @@ class CrawlResource(ServiceResource):
             raise Error(400, message=error_msg)
         return max_items
 
-    def prepare_crawl(self, api_params, scrapy_request_args, *args, **kwargs):
+    def prepare_crawl(
+        self,
+        api_params,
+        scrapy_request_args,
+        *args,
+        request=None,
+        **kwargs,
+    ):
         """Schedule given spider with CrawlManager.
 
         :param dict api_params:
@@ -222,6 +256,10 @@ class CrawlResource(ServiceResource):
         :param dict scrapy_request_args:
             should contain positional and keyword arguments for Scrapy
             Request object that will be created
+
+        :param request:
+            Twisted request the crawl is serving, used to cancel the crawl
+            if the client disconnects.
         """
         spider_name = self.get_required_argument(api_params, "spider_name")
         try:
@@ -248,6 +286,7 @@ class CrawlResource(ServiceResource):
             crawl_args=crawl_args,
             spider_start=api_params.get("spider_start"),
             max_items=max_items,
+            request=request,
             *args,  # noqa: B026
             **kwargs,  # type: ignore[misc]
         )
@@ -263,6 +302,7 @@ class CrawlResource(ServiceResource):
         start_requests=None,
         spider_start=None,
         max_items=None,
+        request=None,
         *args,
         **kwargs,
     ):
@@ -280,7 +320,16 @@ class CrawlResource(ServiceResource):
         )
         if crawl_args:
             kwargs.update(crawl_args)
-        return manager.crawl(*args, **kwargs)
+        dfd = manager.crawl(*args, **kwargs)
+        if request is not None:
+            cancel_on_disconnect = getattr(manager, "cancel", None)
+            if callable(cancel_on_disconnect):
+
+                def cancel_crawl(_failure):
+                    cancel_on_disconnect()
+
+                request.notifyFinish().addErrback(cancel_crawl)
+        return dfd
 
     def prepare_response(self, result, request_data, *_args, **_kwargs):
         items = result.get("items")
