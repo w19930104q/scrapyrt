@@ -40,11 +40,28 @@ class ServiceResource(resource.Resource):
         # deferred result - add appropriate callbacks and errbacks
         result.addErrback(self.handle_error, request)
 
+        request_disconnected = False
+
         def finish_request(obj):
-            request.write(self.render_object(obj, request))
-            request.finish()
+            # The client may have disconnected while the deferred was
+            # pending; writing to or finishing a disconnected request
+            # raises, so it must not be done.
+            if not request_disconnected:
+                request.write(self.render_object(obj, request))
+                request.finish()
+            return obj
+
+        def cancel_on_disconnect(_failure):
+            nonlocal request_disconnected
+            request_disconnected = True
+            cancel_crawl = getattr(result, "cancel_crawl", None)
+            if callable(cancel_crawl):
+                cancel_crawl()
+            # Swallow the failure (by returning None): a lost connection
+            # is expected and must not be logged as an unhandled error.
 
         result.addCallback(finish_request)
+        request.notifyFinish().addErrback(cancel_on_disconnect)
         return server.NOT_DONE_YET
 
     def handle_error(self, exception_or_failure, request):
@@ -280,7 +297,14 @@ class CrawlResource(ServiceResource):
         )
         if crawl_args:
             kwargs.update(crawl_args)
-        return manager.crawl(*args, **kwargs)
+        dfd = manager.crawl(*args, **kwargs)
+        cancel_crawl = getattr(manager, "cancel_crawl", None)
+        if callable(cancel_crawl):
+            # Expose crawl cancellation to the resource layer, so the
+            # crawl can be stopped when the client disconnects before
+            # the response is ready.
+            dfd.cancel_crawl = cancel_crawl  # type: ignore[attr-defined]
+        return dfd
 
     def prepare_response(self, result, request_data, *_args, **_kwargs):
         items = result.get("items")

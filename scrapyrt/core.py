@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import datetime as dt
+import inspect
 from collections import OrderedDict
+from contextlib import suppress
 from copy import deepcopy
 from pathlib import Path
+from typing import Any
 from warnings import warn
 
 from scrapy import Spider, signals
 from scrapy.crawler import Crawler, CrawlerRunner
 from scrapy.exceptions import DontCloseSpider
 from scrapy.http import Request
+from scrapy.utils.defer import deferred_from_coro
+from twisted.internet.error import AlreadyCalled, AlreadyCancelled
 from twisted.web.error import Error
 
 from . import log
@@ -53,6 +58,11 @@ class ScrapyrtCrawlerRunner(CrawlerRunner):
 class CrawlManager:  # pylint: disable=too-many-instance-attributes
     """Runs crawls."""
 
+    #: Object used to schedule the crawl hard deadline, must provide
+    #: a callLater() method. None means the default Twisted reactor;
+    #: tests may replace it with a controlled clock.
+    clock: Any = None
+
     def __init__(  # noqa: PLR0913  # pylint: disable=too-many-positional-arguments
         self,
         spider_name,
@@ -91,6 +101,14 @@ class CrawlManager:  # pylint: disable=too-many-instance-attributes
         self._request_scheduled = False
         self.original_start_methods = {}
         self._cleanup_handler = None
+        # Hard deadline machinery: _timeout_call is the scheduled timeout
+        # call, _terminal_state records the first terminal state reached
+        # by the crawl ("finished", "timeout" or "cancelled") - later
+        # transitions are ignored, _crawl_done is set once the crawl
+        # deferred has fired.
+        self._timeout_call = None
+        self._terminal_state = None
+        self._crawl_done = False
         self._init_spider_start(start_requests, spider_start)
 
     def _init_spider_start(self, start_requests, spider_start):
@@ -143,17 +161,125 @@ class CrawlManager:  # pylint: disable=too-many-instance-attributes
                 )
         if not self.spider_start:
             self.set_dummy_start_methods(spidercls)
-        dfd = self.crawler_runner.crawl(spidercls, *args, **kwargs)
-
-        def cleanup_logging(result):
-            if self._cleanup_handler:
-                self._cleanup_handler()
-            return result
+        self._start_timeout()
+        try:
+            dfd = self.crawler_runner.crawl(spidercls, *args, **kwargs)
+        except Exception:
+            # Startup failed: the crawl deferred will never exist, so
+            # release the timeout and the log resources right away.
+            self._cancel_timeout()
+            self.cleanup_logging(None)
+            raise
 
         dfd.addBoth(self.restore_start_methods)
-        dfd.addBoth(cleanup_logging)
+        dfd.addBoth(self.cleanup_logging)
+        dfd.addBoth(self._crawl_finished)
         dfd.addCallback(self.return_items)
         return dfd
+
+    def cleanup_logging(self, result):
+        if self._cleanup_handler:
+            self._cleanup_handler()
+            self._cleanup_handler = None
+        return result
+
+    def _get_clock(self):
+        """Return the object used to schedule the crawl hard deadline.
+
+        Defaults to the Twisted reactor; can be replaced with a controlled
+        clock (e.g. twisted.internet.task.Clock) via the ``clock``
+        attribute, which is useful in tests.
+        """
+        if self.clock is not None:
+            return self.clock
+        from twisted.internet import reactor  # pylint: disable=import-outside-toplevel
+
+        return reactor
+
+    def _start_timeout(self):
+        """Schedule the hard deadline for this crawl.
+
+        Unlike limit_runtime(), which is only checked when a new request
+        is scheduled, this fires even if the crawl is stuck, e.g. on a
+        hanging download, and no new requests are being scheduled.
+        """
+        self._timeout_call = self._get_clock().callLater(
+            self.timeout_limit,
+            self._on_timeout,
+        )
+
+    def _cancel_timeout(self):
+        call, self._timeout_call = self._timeout_call, None
+        if call is not None:
+            with suppress(AlreadyCalled, AlreadyCancelled):
+                call.cancel()
+
+    def _on_timeout(self):
+        """Hard deadline handler: fail the crawl with HTTP 504 and stop it."""
+        self._timeout_call = None
+        if self._terminal_state is not None:
+            # Another terminal state (finished or cancelled) won the race.
+            return
+        self._terminal_state = "timeout"
+        msg = f"Crawl timeout: TIMEOUT_LIMIT of {self.timeout_limit} seconds exceeded"
+        log.msg(msg, level=log.ERROR)
+        self.user_error = Error(504, message=msg.encode())
+        self._stop_crawl(reason="timeout")
+
+    def cancel_crawl(self):
+        """Cancel the crawl, e.g. because the API client disconnected.
+
+        The crawl is stopped and its timeout is cancelled. The deferred
+        returned by crawl() still fires, so all resources are cleaned up;
+        it is up to the caller to not write to the disconnected request.
+        """
+        if self._terminal_state is not None:
+            # Another terminal state (finished or timeout) won the race.
+            return
+        self._terminal_state = "cancelled"
+        self._cancel_timeout()
+        self._stop_crawl(reason="cancelled")
+
+    def _crawl_finished(self, result):
+        """Mark the crawl as done and release the hard deadline."""
+        self._crawl_done = True
+        self._cancel_timeout()
+        if self._terminal_state is None:
+            self._terminal_state = "finished"
+        return result
+
+    def _stop_crawl(self, reason):
+        """Stop the crawl, cancelling in-flight downloads when supported."""
+        crawler = self.crawler
+        if crawler is None:
+            return
+        engine = getattr(crawler, "engine", None)
+        if engine is None:
+            return
+        close_async = getattr(engine, "close_spider_async", None)
+        if close_async is None:
+            # Scrapy < 2.14: only a graceful close is available.
+            engine.close_spider(crawler.spider, reason=reason)
+            return
+        kwargs = {}
+        if "mode" in inspect.signature(close_async).parameters:
+            # "fast" drops (cancels) in-flight downloads instead of
+            # waiting for them, so a hanging download cannot block
+            # stopping the crawl.
+            kwargs["mode"] = "fast"
+        dfd = deferred_from_coro(
+            close_async(reason=reason, **kwargs),  # pylint: disable=not-callable
+        )
+        dfd.addErrback(self._on_stop_error, reason)
+
+    def _on_stop_error(self, failure, reason):
+        if failure.check(RuntimeError) and not self._crawl_done:
+            # The spider is not opened yet, so it cannot be closed now;
+            # retry shortly, close_spider_async() pends the close once
+            # the spider starts opening.
+            self._get_clock().callLater(0.05, self._stop_crawl, reason)
+            return
+        log.err(failure)
 
     def set_dummy_start_methods(self, spidercls):
         if hasattr(spidercls, "start"):

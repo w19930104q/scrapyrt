@@ -115,6 +115,11 @@ per-file-ignores = [
 
 [tool.pytest.ini_options]
 python_files = ["test_*.py", "test_*/__init__.py"]
+# pytest-twisted (not a test dependency, but may be installed in the
+# environment) runs every test inside its own reactor greenlet, which is
+# incompatible with the in-process reactor integration tests in
+# tests/test_crawl_timeout.py, so it must not be active.
+addopts = ["-p", "no:twisted"]
 
 [tool.ruff.lint]
 extend-select = [
